@@ -1,0 +1,1094 @@
+---
+title: "QIIME_taxonomy"
+author: "Lovro Grum"
+date: "2024-04-11"
+output: html_document
+---
+
+
+```{r}
+library(tidyverse, verbose = FALSE)
+```
+
+# Converting .csv u .RData (once this chunk is ran, it does not have to be ran again because the tables are stored in a list as .RData in the map where this code is).
+It is important thad the .csv tables that are QIIME output are in the same directory (map) as the code
+```{r}
+csv_files_list <- list.files(pattern = ".csv")  # name of the files with taxonomy
+
+taxonomy_tables_list <- sapply(csv_files_list, read.csv)  # loading tables with taxonomy into the R
+taxonomy_tables_list <- sapply(taxonomy_tables_list, as_tibble)  # converting tables to tibble format
+
+names(taxonomy_tables_list) <- sapply(names(taxonomy_tables_list), gsub, pattern = ".csv", replacement = "")  # cleaning the names of the taxonomic tables
+
+saveRDS(taxonomy_tables_list,
+        file = "list_of_taxonomic_tables.RData")  # saving taxonomic tables as .RData so they are easy accessible
+```
+
+
+# Extraction of specifics
+
+## functions
+```{r}
+Percentage.in.sample <- function(table) {
+  
+  divider <- table %>%
+    select(-1) %>% 
+    rowSums()
+  
+  table_with_percentage <- table %>%
+    mutate_if(is.numeric, function(column) { 
+      percentage = column / divider * 100
+      round(percentage, 2)
+  })
+  
+  return(table_with_percentage)
+  
+}
+
+Unique.assigned.OTU <- function(table,  # table of raw OTUs
+                                by_what,  # by which group is producing (which column of metadata)
+                                metadata) {
+  
+  columns_to_remove <- names(metadata)[which(names(metadata) != by_what)]
+  
+  final_table <- table %>% 
+    left_join(metadata, by = "sample") %>%  # mearginig two tables by column sample
+    select(-all_of(columns_to_remove)) %>%  # removing not needed metadata
+    select(-contains("Unassigned")) %>%  # removing unassigned columns
+    select(-contains(".__")) %>%  # removing columns that do not contain assignment for that taxonomic level 
+    relocate(by_what) %>%
+    group_by(eval(parse(text = by_what))) %>%  # calling string as variable name
+    summarize(across(where(is.numeric), sum)) %>%
+    rowwise() %>%
+    mutate(unique = ncol(.) - 1 - sum(c_across(2:ncol(.)) == 0), .keep = "unused")
+  
+  final_table
+  
+} 
+
+Saving.OTU.numbers.all.levels <- function(OTU_numbers_tables, taxonomic_tables, name_of_the_file, for_what_is_saving) {
+  
+  xy_OTU_all_taxonomic_levels <- tibble(group = pull(OTU_numbers_tables[[1]], 1))
+    sapply(OTU_numbers_tables, function(table){
+      
+      xy_OTU_all_taxonomic_levels <<- bind_cols(xy_OTU_all_taxonomic_levels, select(table, 2))
+      
+    })
+    names(xy_OTU_all_taxonomic_levels) <- c(for_what_is_saving, names_of_taxonomic_levels)
+  
+  write_tsv(xy_OTU_all_taxonomic_levels, name_of_the_file)
+  
+  return(xy_OTU_all_taxonomic_levels)
+  
+}
+
+QIIME.taxonomy.name.cleaning <- function(first_letter_of_taxonomy_level, certain_taxonomic_level){
+  
+  old_col_names <- colnames(certain_taxonomic_level)[-1]  
+  positions_of_taxonomic_level_in_the_name <- gregexpr(paste0(first_letter_of_taxonomy_level, "__"), old_col_names)
+    
+  indexes <- 1:length(old_col_names)
+  new_col_names <- sapply(indexes, function(index) {  # extracting the proper name
+    position <- positions_of_taxonomic_level_in_the_name[[index]][1]
+    name <- old_col_names[index]
+    start_position = position + 3
+    end_position = nchar(name)
+    name_with_dots <- substr(x = name,
+                             start = start_position,
+                             stop = end_position)
+  })
+  
+  return(new_col_names)
+}
+
+Removing.unassigned.levels <- function(name) {  # takes one name and removes all characters until it got the first certain taxonomic level
+  
+  new_name <- gsub(pattern = ".{4}$", 
+                   replacement = "",
+                   x = name)
+  
+  if (endsWith(new_name, "_")) {
+    
+    return(Removing.unassigned.levels(new_name))
+    
+  } else {
+    
+    return(new_name)
+    
+  }
+  
+  
+}
+
+Filtering.50.or.more <- function(table){
+  
+  names_more_than_50 <- table %>% 
+    summarise_if(is.numeric, sum) %>% 
+    select_if(.predicate = . >= 50) %>% 
+    names
+  
+  filtered_table <- table %>% 
+    select(names_more_than_50)
+  
+  final_filtered_table <- bind_cols(select(table, 1), filtered_table)
+  
+  return(final_filtered_table)
+  
+}
+
+Unique.among.all <- function(table){
+  
+  all_OTUs_known <- table %>%
+    select(-ends_with("_"))
+  
+  return(all_OTUs_known)
+  
+}
+
+Unique.among.all.unknown <- function(table){
+  
+  all_OTUs_known <- table %>%
+    select(ends_with("_")) %>%
+    select(-ends_with(".__"))
+  
+  return(all_OTUs_known)
+  
+}
+```
+
+
+
+## loading tables and variables
+```{r}
+taxonomic_tables_with_metadata <- readRDS("list_of_taxonomic_tables.RData")  # needs to be in the same directory
+
+metadata <- dplyr::select(taxonomic_tables_with_metadata$kingdom, -c(2, 3, 4)) %>%  # metadata for all the tables is the same, so it needs to be extracted only from one table
+  rename(sample = index)  # renaming default QIIME output column name "index" to "sample" (column name "index" is useful if there are replicates)
+
+taxonomic_tables <- sapply(taxonomic_tables_with_metadata, function(table){  # extracting only counts for each OTU
+  n_cols <- ncol(table)
+  dplyr::select(table, -c(n_cols - 3, n_cols - 2, n_cols - 1, n_cols)) %>%  # this part might me different, depending on how many metadata columns are there and where are they placed
+    rename(sample = index)  # renaming default QIIME output column name "index" to "sample" (column name "index" is useful if there are replicates)
+})
+
+names_of_taxonomic_levels <- names(taxonomic_tables)
+```
+
+
+```{r}
+# saving raw percentage of the OTUs in each sample for each taxonomic level in separate directory
+dir.create("Percentage in sample raw")
+for(i in 1:7){  
+  write_tsv(Percentage.in.sample(taxonomic_tables[[i]]), file = paste0("Percentage in sample raw/", names_of_taxonomic_levels[i], "_percentage_in_sample_raw.tsv"))
+}
+```
+
+
+## Saving tables with different OTU metrics
+
+### Number of unique assigned OTU 
+#### among all samples
+```{r}
+numbers_of_unique_assigned_OTU_samples <- lapply(taxonomic_tables, Unique.assigned.OTU, by_what = "sample", metadata = metadata)
+
+dir.create("Numbers of unique assigned OTUs")
+unique_assigned_OTU_all_taxonomic_levels <- Saving.OTU.numbers.all.levels(numbers_of_unique_assigned_OTU_samples, 
+                                                                          taxonomic_tables, 
+                                                                          "Numbers of unique assigned OTUs/number_of_unique_assigned_OTU_samples.tsv",
+                                                                          "sample")
+```
+
+#### among reactor
+```{r}
+numbers_of_unique_assigned_OTU_reactor <- lapply(taxonomic_tables, Unique.assigned.OTU, by_what = "reactor", metadata = metadata)
+
+unique_assigned_OTU_all_taxonomic_levels_reactors <- Saving.OTU.numbers.all.levels(numbers_of_unique_assigned_OTU_reactor, 
+                                                                                   taxonomic_tables, 
+                                                                                   "Numbers of unique assigned OTUs/number_of_unique_assigned_OTU_reactor.tsv",
+                                                                                   "reactor")
+```
+
+#### among substrates
+```{r}
+numbers_of_unique_assigned_OTU_substrate <- lapply(taxonomic_tables, Unique.assigned.OTU, by_what = "added_supstrate", metadata = metadata)
+
+unique_assigned_OTU_all_taxonomic_levels_substrate <- Saving.OTU.numbers.all.levels(numbers_of_unique_assigned_OTU_substrate, 
+                                                                                   taxonomic_tables, 
+                                                                                   "Numbers of unique assigned OTUs/number_of_unique_assigned_OTU_substrate.tsv",
+                                                                                   "added_supstrate")
+```
+
+### Number of unassigned OTUs (only per sample)
+```{r}
+nubers_of_unassigned_OTU <- lapply(taxonomic_tables, function(tablica) {
+  tablica %>% 
+    select(1, contains(c("Unassigned", ".__")) ) %>%
+    rowwise() %>%
+    mutate(unassigned_at_that_level = ncol(.) - 1 - sum(c_across(2:ncol(.)) == 0), .keep = "unused")
+})
+
+unassigned_OTU_all_taxonomic_levels <- Saving.OTU.numbers.all.levels(nubers_of_unassigned_OTU, 
+                                                                     taxonomic_tables, 
+                                                                     "number_of_unassigned_OTU.tsv",
+                                                                     "sample")
+```
+
+### Assigned OTUs ------- za ta dva bi isto mogao smislit funkcije, tu si stao
+#### making necessary directories 
+```{r}
+dir.create("known OTUs")
+dir.create("unknown OTUs")
+```
+#### Known OTUs
+```{r}
+known_OTUs <- lapply(taxonomic_tables, function(table) {  # getting OTUs that are assigned to known taxonomy and their counts 
+  
+  name_position <- which(taxonomic_tables %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(taxonomic_tables)[[name_position]]  # taxonomic level for which known OTUs are gathered
+  first_letter_of_taxonomy_level <- substr(taxonomy_level, 1, 1)  # needed for extracting taxonomy name from the names of the columns
+  
+  print(paste0("Doing KNOWN ", taxonomy_level))
+
+  file_name <- paste0(taxonomy_level, ".tsv")  # name of the file in which table will be written
+    
+  certain_level <- table %>%  # removing unknown and unassigned OTUs for that taxonomic level
+    select(-contains(c("Unassigned", ".__"))) %>%
+    select(-ends_with("__"))
+  
+  # getting only the name of the that taxonomy 
+  if (first_letter_of_taxonomy_level == "s") {  # if it is the level of species, then the name will be written as scientific name
+    
+    first_letter_of_taxonomy_level <- "g"  # the first needed letter of taxonomy is taken for genus
+    new_col_names_with_s <- QIIME.taxonomy.name.cleaning(first_letter_of_taxonomy_level, certain_level)  # cleaning the name
+    new_col_names <- sapply(new_col_names_with_s, gsub, pattern = ".s__", replacement = " ")  # getting final scientific name of the species
+    
+  
+  } else if (first_letter_of_taxonomy_level == "g") {  # some genera are polyphyletic so different family will have the same genus
+    
+    first_letter_of_taxonomy_level <- "f"  # the first needed letter of taxonomy is taken for family
+    new_col_names_with_g <- QIIME.taxonomy.name.cleaning(first_letter_of_taxonomy_level, certain_level)  # cleaning the name of the OTU
+    new_col_names <- sapply(new_col_names_with_g, function(name) {  # puting family name into brackets after the name of the genus
+      clean_name <- strsplit(x = name, 
+                             split = ".g__") %>% unlist
+      new_name <- paste0(clean_name[2], " (", clean_name[1], ")")})  
+    
+  } else {
+    
+    new_col_names <- QIIME.taxonomy.name.cleaning(first_letter_of_taxonomy_level, certain_level)  # cleaning the name of the OTU
+  
+  }
+  
+  names(certain_level) <- c(colnames(certain_level)[1], new_col_names)  # replacing old name with the new ones
+  
+  write_tsv(certain_level,
+            paste0("known OTUs/", "known_counts_", file_name))  # saving counts for each OTU
+  
+  return(certain_level)
+  
+})
+
+percentage_known_OTUs <- lapply(known_OTUs, function(table) {
+  
+  name_position <- which(known_OTUs %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(known_OTUs)[[name_position]]  # taxonomic level for which known OTUs are gathered
+  file_name <- paste0(taxonomy_level, ".tsv")  # name of the file in which table will be written
+  
+  certain_level_percentage <- Percentage.in.sample(table)
+  
+  write_tsv(certain_level_percentage,
+            paste0("known OTUs/", "known_percentage_", file_name))  # saving percentage for each OTU (percentage refers to known OTUs, not all of them)
+  
+  return(certain_level_percentage)
+
+})
+```
+
+#### Unknown OTUs
+```{r}
+unknown_OTUs <- lapply(taxonomic_tables[-4], function(table) {  # getting OTUs that are assigned to known taxonomy
+  
+  name_position <- which(taxonomic_tables %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(taxonomic_tables)[[name_position]]  # taxonomic level for which known OTUs are gathered
+  first_letter_of_taxonomy_level <- substr(taxonomy_level, 1, 1)  # needed for extracting taxonomy name from the names of the columns
+  
+  print(paste0("Doing UNKNOWN ", taxonomy_level))
+  
+  file_name <- paste0(taxonomy_level, ".tsv")  # name of the file in which table will be written
+    
+  certain_level <- table %>%  # removing unknown and unassigned OTUs for that taxonomic level
+    select(-contains(c("Unassigned", ".__"))) %>%
+    select("sample", ends_with("__"))  # leaving only assigned but unknown OTUs
+  
+  old_names <- names(certain_level)[-1]
+  
+  clean_names <- sapply(old_names, Removing.unassigned.levels) %>% unname  # removing all level that have no taxonomic names
+
+  positions_of_the_last_bottom_dashes <- gregexpr(pattern = "__",
+                                                  text = clean_names)  # getting position of the last taxonomic level that has name
+
+  indexes <- 1:length(clean_names)  # range of indexes to get proper position in from the list "positions_of_the_last_bottom_dashes"
+  
+  new_col_names <- sapply(indexes, function(index) {  # extracting the proper name
+    position <- positions_of_the_last_bottom_dashes[[index]]  # getting all positions
+    last_position <- tail(position, 1)  # getting last position
+    
+    name <- clean_names[index]  # getting the name of the OTU which name is cleaning
+    start_position = last_position - 1  # starting position of the proper name
+    end_position = nchar(name)  # last position of the propet name
+    
+    last_assigned_name <- substr(x = name,
+                                 start = start_position,
+                                 stop = end_position)  # whole proper name
+    
+    if (startsWith(last_assigned_name, "k")){
+      
+      long_last_assigned_name <- gsub(pattern = "k__",
+                                      replacement = " kingdom ",
+                                      x = last_assigned_name)  # replacing first letters of taxonomic levels with the whole name of the taxonomic level (it is the same for the other but for different taxonomic levels)
+      
+      new_name <- paste0(taxonomy_level, " of the", long_last_assigned_name)  # writing final proper name
+      
+    } else if (startsWith(last_assigned_name, "p")){
+      
+      long_last_assigned_name <- gsub(pattern = "p__",
+                                      replacement = " phylum ",
+                                      x = last_assigned_name)
+      
+      new_name <- paste0(taxonomy_level, " of the", long_last_assigned_name)
+      
+    } else if (startsWith(last_assigned_name, "c")){
+      
+      long_last_assigned_name <- gsub(pattern = "c__",
+                                      replacement = " class ",
+                                      x = last_assigned_name)
+      
+      new_name <- paste0(taxonomy_level, " of the", long_last_assigned_name)
+      
+    } else if (startsWith(last_assigned_name, "o")){
+      
+      long_last_assigned_name <- gsub(pattern = "o__",
+                                      replacement = " order ",
+                                      x = last_assigned_name)
+      
+      new_name <- paste0(taxonomy_level, " of the", long_last_assigned_name)
+      
+    } else if (startsWith(last_assigned_name, "f")){
+      
+      long_last_assigned_name <- gsub(pattern = "f__",
+                                      replacement = " family ",
+                                      x = last_assigned_name)
+      
+      new_name <- paste0(taxonomy_level, " of the", long_last_assigned_name)
+      
+    } else if (startsWith(last_assigned_name, "g")){
+      
+      long_last_assigned_name <- gsub(pattern = "g__",
+                                      replacement = " genus ",
+                                      x = last_assigned_name)
+      
+      new_name <- paste0(taxonomy_level, " of the", long_last_assigned_name)
+      
+    }
+
+  })
+  
+  names(certain_level) <- c(colnames(certain_level)[1], new_col_names)  # replacing old names with new ones
+  
+  write_tsv(certain_level,
+            paste0("unknown OTUs/", "unknown_counts_", file_name))  # saving counts for each OTU
+   
+  return(certain_level)
+   
+})
+
+percentage_unknown_OTUs <- lapply(unknown_OTUs, function(table) {
+  
+  name_position <- which(unknown_OTUs %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(unknown_OTUs)[[name_position]]  # taxonomic level for which known OTUs are gathered
+  file_name <- paste0(taxonomy_level, ".tsv")  # name of the file in which table will be written
+  
+  certain_level_percentage <- Percentage.in.sample(table)
+  
+  write_tsv(certain_level_percentage,
+            paste0("unknown OTUs/", "unknown_percentage_", file_name))  # saving percentage for each OTU (percentage refers to known OTUs, not all of them)
+  
+  return(certain_level_percentage)
+
+})
+```
+
+## Core microbiome
+### making necessary directories 
+```{r}
+dir.create("core micriobiomes")
+for (level1 in c("all samples", "all reactors", "all substrates")){
+  dir.create(paste0("core micriobiomes", "/", level1))  # giving proper path where to make new directory
+  for (level2 in c("known", "unknown")) {
+    dir.create(paste0("core micriobiomes", "/", level1, "/", level2))
+    for (level3 in c("percentage", "total number", "only names")){
+      dir.create(paste0("core micriobiomes", "/", level1, "/", level2, "/", level3))
+    }
+  }
+}
+```
+
+### KNOWN core microbiome 
+#### all samples
+```{r}
+core_known_microbiome_samples <- sapply(percentage_known_OTUs, function(table){
+  
+  core_known_microbiome_for_the_level <- table %>%
+    column_to_rownames("sample") %>%
+    dplyr::select(where(~prod(.) != 0)) %>%  # filtering out columns that have at least one 0 in it
+    rownames_to_column("sample")
+  
+  name_position <- which(percentage_known_OTUs %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(percentage_known_OTUs)[[name_position]]
+  file_name = paste0("core_known_microbiome_", taxonomy_level, ".tsv")
+    
+  write_tsv(core_known_microbiome_for_the_level,
+            paste0("core micriobiomes/all samples/known/percentage/", file_name))
+
+  write_tsv(tibble(names = colnames(core_known_microbiome_for_the_level[-1])),
+            paste0("core micriobiomes/all samples/known/only names/", taxonomy_level, ".tsv"))
+  
+  core_known_microbiome_for_the_level
+  
+})
+```
+#### categocical metadadta
+```{r}
+known_OTUs_metadata <- lapply(known_OTUs, left_join, y = metadata, by = "sample")
+```
+##### reactor
+```{r}
+known_OTUs_reactor <- lapply(known_OTUs_metadata, function(table) {
+  
+  grouped_summed_table <- table %>%
+    select(-c("sample", "methane_production", "quality", "added_supstrate")) %>%
+    group_by(reactor) %>%
+    summarize(across(where(is.numeric), sum))
+  
+})
+
+percentage_known_OTUs_reactor <- lapply(known_OTUs_reactor, Percentage.in.sample)
+
+core_known_microbiome_reactor <- sapply(percentage_known_OTUs_reactor, function(table){
+  
+  core_known_microbiome_for_the_level <- table %>%
+    column_to_rownames("reactor") %>%
+    dplyr::select(where(~prod(.) != 0)) %>%  # filtering out columns that have at least one 0 in it
+    rownames_to_column("reactor")
+  
+  name_position <- which(percentage_known_OTUs_reactor %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(percentage_known_OTUs_reactor)[[name_position]]
+  file_name = paste0("core_known_microbiome_reactor_", taxonomy_level, ".tsv")
+  
+  write_tsv(core_known_microbiome_for_the_level,
+            paste0("core micriobiomes/all reactors/known/percentage/", file_name))
+
+  write_tsv(tibble(names = colnames(core_known_microbiome_for_the_level[-1])),
+            paste0("core micriobiomes/all reactors/known/only names/", taxonomy_level, ".tsv"))
+  
+  core_known_microbiome_for_the_level
+  
+})
+
+
+```
+##### added_substrate
+```{r}
+known_OTUs_substrate <- lapply(known_OTUs_metadata, function(table) {
+  
+  grouped_summed_table <- table %>%
+    select(-c("sample", "methane_production", "quality", "reactor")) %>%
+    group_by(added_supstrate) %>%
+    summarize(across(where(is.numeric), sum))
+  
+  })
+
+percentage_known_OTUs_substrate <- lapply(known_OTUs_substrate, Percentage.in.sample)
+
+core_known_microbiome_substrate <- sapply(percentage_known_OTUs_substrate, function(table){
+  
+  core_known_microbiome_for_the_level <- table %>%
+    column_to_rownames("added_supstrate") %>%
+    dplyr::select(where(~prod(.) != 0)) %>%  # filtering out columns that have at least one 0 in it
+    rownames_to_column("added_supstrate")
+  
+  name_position <- which(percentage_known_OTUs_substrate %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(percentage_known_OTUs_substrate)[[name_position]]
+  file_name = paste0("core_known_microbiome_substrate_", taxonomy_level, ".tsv")
+  
+  write_tsv(core_known_microbiome_for_the_level,
+            paste0("core micriobiomes/all substrates/known/percentage/", file_name))
+
+  write_tsv(tibble(names = colnames(core_known_microbiome_for_the_level[-1])),
+            paste0("core micriobiomes/all substrates/known/only names/", taxonomy_level, ".tsv"))
+  
+  core_known_microbiome_for_the_level
+  
+})
+```
+
+
+### UNKNOWN core microbiome
+#### all samples
+```{r}
+core_unknown_microbiome_samples <- sapply(percentage_unknown_OTUs[-5], function(table){
+  
+  core_unknown_microbiome_for_the_level <- table %>%
+    column_to_rownames("sample") %>%
+    dplyr::select(where(~prod(.) != 0)) %>%  # filtering out columns that have at least one 0 in it
+    rownames_to_column("sample")
+  
+  name_position <- which(percentage_unknown_OTUs %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(percentage_unknown_OTUs)[[name_position]]
+  file_name = paste0("core_unknown_microbiome_", taxonomy_level, ".tsv")
+  
+  write_tsv(core_unknown_microbiome_for_the_level,
+            paste0("core micriobiomes/all samples/unknown/percentage/", file_name))
+
+  write_tsv(tibble(names = colnames(core_unknown_microbiome_for_the_level[-1])),
+            paste0("core micriobiomes/all samples/unknown/only names/", taxonomy_level, ".tsv"))
+  
+  core_unknown_microbiome_for_the_level
+  
+})
+```
+#### categocical metadata
+```{r}
+unknown_OTUs_metadata <- lapply(unknown_OTUs, left_join, y = metadata, by = "sample")
+```
+##### reactor
+```{r}
+unknown_OTUs_reactor <- lapply(unknown_OTUs_metadata, function(table) {
+  
+  grouped_summed_table <- table %>%
+    select(-c("sample", "methane_production", "quality", "added_supstrate")) %>%
+    group_by(reactor) %>%
+    summarize(across(where(is.numeric), sum))
+  
+  })
+
+percentage_unknown_OTUs_reactor <- lapply(unknown_OTUs_reactor, Percentage.in.sample)
+
+core_unknown_microbiome_reactor <- sapply(percentage_unknown_OTUs_reactor, function(table){
+  
+  core_unknown_microbiome_for_the_level <- table %>%
+    column_to_rownames("reactor") %>%
+    dplyr::select(where(~prod(.) != 0)) %>%  # filtering out columns that have at least one 0 in it
+    rownames_to_column("reactor")
+  
+  name_position <- which(percentage_unknown_OTUs_reactor %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(percentage_unknown_OTUs_reactor)[[name_position]]
+  file_name = paste0("core_unknown_microbiome_reactor_", taxonomy_level, ".tsv")
+  
+  write_tsv(core_unknown_microbiome_for_the_level,
+            paste0("core micriobiomes/all reactors/unknown/percentage/", file_name))
+
+  write_tsv(tibble(names = colnames(core_unknown_microbiome_for_the_level[-1])),
+            paste0("core micriobiomes/all reactors/unknown/only names/", taxonomy_level, ".tsv"))
+  
+  core_unknown_microbiome_for_the_level
+  
+})
+
+```
+##### added_substrate
+```{r}
+unknown_OTUs_substrate <- lapply(unknown_OTUs_metadata, function(table) {
+  
+  grouped_summed_table <- table %>%
+    select(-c("sample", "methane_production", "quality", "reactor")) %>%
+    group_by(added_supstrate) %>%
+    summarize(across(where(is.numeric), sum))
+  
+  })
+
+percentage_unknown_OTUs_substrate <- lapply(unknown_OTUs_substrate, Percentage.in.sample)
+
+core_unknown_microbiome_substrate <- sapply(percentage_unknown_OTUs_substrate, function(table){
+  
+  core_unknown_microbiome_for_the_level <- table %>%
+    column_to_rownames("added_supstrate") %>%
+    dplyr::select(where(~prod(.) != 0)) %>%  # filtering out columns that have at least one 0 in it
+    rownames_to_column("added_supstrate")
+  
+  name_position <- which(percentage_unknown_OTUs_substrate %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(percentage_unknown_OTUs_substrate)[[name_position]]
+  file_name = paste0("core_unknown_microbiome_substrate_", taxonomy_level, ".tsv")
+  
+  write_tsv(core_unknown_microbiome_for_the_level,
+            paste0("core micriobiomes/all substrates/unknown/percentage/", file_name))
+
+  write_tsv(tibble(names = colnames(core_unknown_microbiome_for_the_level[-1])),
+            paste0("core micriobiomes/all substrates/unknown/only names/", taxonomy_level, ".tsv"))
+  
+  core_unknown_microbiome_for_the_level
+  
+})
+```
+
+
+## "overaboundant" core microbiome
+### KNOWN core microbiome 
+#### all samples
+```{r}
+total_reads_KNOWN_OTUs_per_sample <- sapply(known_OTUs, function(table) {
+  
+  table %>% 
+    column_to_rownames("sample") %>%
+    rowSums()
+  
+})
+
+numbers_of_KNOWN_assigned_OTU <- lapply(taxonomic_tables, function(table) {  # since there was an update in tidyverse, this is not working properly, so, I will correct it later
+  table %>% 
+    select(-contains("Unassigned")) %>%  # removing unassigned columns
+    select(-ends_with("__")) %>%  # removing columns that do not contain assignment for that taxonomic level 
+    rowwise() %>%
+    dplyr::mutate(known = ncol(.) - 1 - sum(c_across(2:ncol(.)) == 0), .keep = "unused")
+})
+
+KNOWN_assigned_OTU_all_taxonomic_levels <- Saving.OTU.numbers.all.levels(numbers_of_KNOWN_assigned_OTU, 
+                                                                         taxonomic_tables, 
+                                                                         "number_of_known_assigned_OTU.tsv",
+                                                                         "sample")
+
+expected_number_of_reads_KNOWN_OTUs <- total_reads_KNOWN_OTUs_per_sample/column_to_rownames(KNOWN_assigned_OTU_all_taxonomic_levels, "sample")
+expected_percentage_of_reads_KNOWN_OTUs <- expected_number_of_reads_KNOWN_OTUs/total_reads_KNOWN_OTUs_per_sample * 100 
+
+difference_of_percentage_than_expected_percentage_of_core_known_microbiome_samples <- sapply(core_known_microbiome_samples, function(table){
+  
+  name_position <- which(core_known_microbiome_samples %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(core_known_microbiome_samples)[[name_position]]
+  
+  difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level <- table %>%
+    mutate_if(is.numeric, ~ round(./pull(expected_percentage_of_reads_KNOWN_OTUs, name_position), 2))
+  
+  print(difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level)
+
+  file_name <- paste0("difference_of_percentage_than_expected_percentage_of_core_known_microbiome_", taxonomy_level, ".tsv")
+  
+  write_tsv(difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level,
+            paste0("core micriobiomes/all samples/known/only names/", file_name))
+
+  difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level
+  
+})
+```
+#### categocical metadadta
+```{r}
+total_reads_KNOWN_OTUs_per_sample_metadata <- total_reads_KNOWN_OTUs_per_sample %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample") %>% 
+  left_join(x = ., y = metadata, by = "sample")
+```
+##### reactor
+```{r}
+total_reads_KNOWN_OTUs_per_sample_metadata <- total_reads_KNOWN_OTUs_per_sample %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample") %>% 
+  left_join(x = ., y = metadata, by = "sample")
+
+total_reads_KNOWN_OTUs_reactors <- total_reads_KNOWN_OTUs_per_sample_metadata %>%
+  select(-c("sample", "methane_production", "quality", "added_supstrate")) %>%
+    group_by(reactor) %>%
+    summarize(across(where(is.numeric), sum))
+
+numbers_of_KNOWN_assigned_OTU_reactors <- lapply(taxonomic_tables, function(table) {
+  table %>% 
+    left_join(x = metadata, y = ., by = "sample") %>%
+    select(-contains(c("Unassigned", "sample", "methane_production", "quality", "added_supstrate"))) %>%  # removing unassigned columns
+    select(-ends_with("__")) %>%  # removing columns that do not contain assignment for that taxonomic level 
+    group_by(reactor) %>%
+    summarize(across(where(is.numeric), sum)) %>%
+    rowwise() %>%
+    mutate(known = ncol(.) - 1 - sum(c_across(2:ncol(.)) == 0), .keep = "unused")
+})
+
+KNOWN_assigned_OTU_all_taxonomic_levels_reactors <- tibble(reactor = c("Ave", "Baia", "Hom", "Sousa", "VReal"))
+
+sapply(numbers_of_KNOWN_assigned_OTU_reactors, function(table){
+  
+  name_position <- which(numbers_of_KNOWN_assigned_OTU_reactors %in% list(table))  
+  names(table) <- c("reactor", names(numbers_of_KNOWN_assigned_OTU_reactors)[[name_position]])
+  
+  KNOWN_assigned_OTU_all_taxonomic_levels_reactors <<- left_join(KNOWN_assigned_OTU_all_taxonomic_levels_reactors, table, by = "reactor")
+})
+
+expected_number_of_reads_KNOWN_OTUs_reactor <- column_to_rownames(total_reads_KNOWN_OTUs_reactors, "reactor")/column_to_rownames(KNOWN_assigned_OTU_all_taxonomic_levels_reactors, "reactor")
+expected_percentage_of_reads_KNOWN_OTUs_reactor <- expected_number_of_reads_KNOWN_OTUs_reactor/column_to_rownames(total_reads_KNOWN_OTUs_reactors, "reactor") * 100 
+
+difference_of_percentage_than_expected_percentage_of_core_known_microbiome_reactors <- sapply(core_known_microbiome_reactor, function(table){
+  
+  name_position <- which(core_known_microbiome_reactor %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(core_known_microbiome_reactor)[[name_position]]
+  
+  difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level <- table %>%
+    mutate_if(is.numeric, ~round(./pull(expected_percentage_of_reads_KNOWN_OTUs_reactor, name_position), 2))
+
+
+  file_name = paste0("difference_of_percentage_than_expected_percentage_of_core_known_microbiome_", taxonomy_level, ".tsv")
+  
+  {setwd("core micriobiomes/by reactors/only names/known")
+
+   write_tsv(difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level,
+             file_name)
+
+   setwd("../../../..")}
+
+  difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level
+  
+})
+
+```
+
+##### added_substrate
+```{r}
+total_reads_KNOWN_OTUs_added_substrate <- total_reads_KNOWN_OTUs_per_sample_metadata %>%
+  select(-c("sample", "methane_production", "quality", "reactor")) %>%
+    group_by(added_supstrate) %>%
+    summarize(across(where(is.numeric), sum))
+
+numbers_of_KNOWN_assigned_OTU_added_substrate <- lapply(taxonomic_tables, function(table) {
+  table %>% 
+    left_join(x = metadata, y = ., by = "sample") %>%
+    select(-contains(c("Unassigned", "sample", "methane_production", "quality", "reactor"))) %>%  # removing unassigned columns
+    select(-ends_with("__")) %>%  # removing columns that do not contain assignment for that taxonomic level 
+    group_by(added_supstrate) %>%
+    summarize(across(where(is.numeric), sum)) %>%
+    rowwise() %>%
+    mutate(known = ncol(.) - 1 - sum(c_across(2:ncol(.)) == 0), .keep = "unused")
+})
+
+KNOWN_assigned_OTU_all_taxonomic_levels_added_substrate <- tibble(added_supstrate = c("/", "fats", "whey"))
+
+sapply(numbers_of_KNOWN_assigned_OTU_added_substrate, function(table){
+  
+  name_position <- which(numbers_of_KNOWN_assigned_OTU_added_substrate %in% list(table))  
+  names(table) <- c("added_supstrate", names(numbers_of_KNOWN_assigned_OTU_added_substrate)[[name_position]])
+  
+  KNOWN_assigned_OTU_all_taxonomic_levels_added_substrate <<- left_join(KNOWN_assigned_OTU_all_taxonomic_levels_added_substrate, table, by = "added_supstrate")
+})
+
+expected_number_of_reads_KNOWN_OTUs_added_substrate <- column_to_rownames(total_reads_KNOWN_OTUs_added_substrate, "added_supstrate")/column_to_rownames(KNOWN_assigned_OTU_all_taxonomic_levels_added_substrate, "added_supstrate")
+expected_percentage_of_reads_KNOWN_OTUs_added_substrate <- expected_number_of_reads_KNOWN_OTUs_added_substrate/column_to_rownames(total_reads_KNOWN_OTUs_added_substrate, "added_supstrate") * 100 
+
+difference_of_percentage_than_expected_percentage_of_core_known_microbiome_added_substrate <- sapply(core_known_microbiome_substrate, function(table){
+  
+  name_position <- which(core_known_microbiome_substrate %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(core_known_microbiome_substrate)[[name_position]]
+  
+  difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level <- table %>%
+    mutate_if(is.numeric, ~round(./pull(expected_percentage_of_reads_KNOWN_OTUs_added_substrate, name_position), 2))
+
+
+  file_name = paste0("difference_of_percentage_than_expected_percentage_of_core_known_microbiome_", taxonomy_level, ".tsv")
+  
+  {setwd("core micriobiomes/by substrate/only names/known")
+
+   write_tsv(difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level,
+             file_name)
+
+   setwd("../../../..")}
+
+  difference_of_percentage_than_expected_percentage_of_core_known_microbiome_for_the_level
+  
+})
+```
+
+
+
+
+
+
+
+
+
+
+### UNKNOWN core microbiome 
+#### all samples
+```{r}
+total_reads_UNKNOWN_OTUs_per_sample <- sapply(unknown_OTUs, function(table) {
+  
+  table %>% 
+    column_to_rownames("sample") %>%
+    rowSums()
+  
+})
+
+numbers_of_UNKNOWN_assigned_OTU <- lapply(taxonomic_tables, function(table) {
+  table %>% 
+    select(-contains("Unassigned")) %>%  # removing unassigned columns
+    select(-ends_with("__")) %>%  # removing columns that do not contain assignment for that taxonomic level 
+    rowwise() %>%
+    mutate(unknown = ncol(.) - 1 - sum(c_across(2:ncol(.)) == 0), .keep = "unused")
+})
+
+UNKNOWN_assigned_OTU_all_taxonomic_levels <- Saving.OTU.numbers.all.levels(numbers_of_UNKNOWN_assigned_OTU, 
+                                                                           taxonomic_tables, 
+                                                                           "number_of_unknown_assigned_OTU.tsv")
+
+expected_number_of_reads_UNKNOWN_OTUs <- total_reads_UNKNOWN_OTUs_per_sample/column_to_rownames(UNKNOWN_assigned_OTU_all_taxonomic_levels, "sample")
+expected_percentage_of_reads_UNKNOWN_OTUs <- expected_number_of_reads_UNKNOWN_OTUs/total_reads_UNKNOWN_OTUs_per_sample * 100 
+
+difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_samples <- sapply(core_unknown_microbiome_samples, function(table){
+  
+  name_position <- which(core_unknown_microbiome_samples %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(core_unknown_microbiome_samples)[[name_position]]
+  
+  difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level <- table %>%
+    mutate_if(is.numeric, ~round(./pull(expected_percentage_of_reads_UNKNOWN_OTUs, name_position), 2))
+
+
+  file_name = paste0("difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_", taxonomy_level, ".tsv")
+  
+  {setwd("core micriobiomes/by all samples/only names/unknown")
+
+   write_tsv(difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level,
+             file_name)
+
+   setwd("../../../..")}
+
+  difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level
+  
+})
+```
+#### categocical metadadta
+```{r}
+total_reads_UNKNOWN_OTUs_per_sample_metadata <- total_reads_UNKNOWN_OTUs_per_sample %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample") %>% 
+  left_join(x = ., y = metadata, by = "sample")
+```
+##### reactor
+```{r}
+total_reads_UNKNOWN_OTUs_per_sample_metadata <- total_reads_UNKNOWN_OTUs_per_sample %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample") %>% 
+  left_join(x = ., y = metadata, by = "sample")
+
+total_reads_UNKNOWN_OTUs_reactors <- total_reads_UNKNOWN_OTUs_per_sample_metadata %>%
+  select(-c("sample", "methane_production", "quality", "added_supstrate")) %>%
+    group_by(reactor) %>%
+    summarize(across(where(is.numeric), sum))
+
+numbers_of_UNKNOWN_assigned_OTU_reactors <- lapply(taxonomic_tables, function(table) {
+  table %>% 
+    left_join(x = metadata, y = ., by = "sample") %>%
+    select(-contains(c("Unassigned", "sample", "methane_production", "quality", "added_supstrate"))) %>%  # removing unassigned columns
+    select(-ends_with("__")) %>%  # removing columns that do not contain assignment for that taxonomic level 
+    group_by(reactor) %>%
+    summarize(across(where(is.numeric), sum)) %>%
+    rowwise() %>%
+    mutate(unknown = ncol(.) - 1 - sum(c_across(2:ncol(.)) == 0), .keep = "unused")
+})
+
+UNKNOWN_assigned_OTU_all_taxonomic_levels_reactors <- tibble(reactor = c("Ave", "Baia", "Hom", "Sousa", "VReal"))
+
+sapply(numbers_of_UNKNOWN_assigned_OTU_reactors, function(table){
+  
+  name_position <- which(numbers_of_UNKNOWN_assigned_OTU_reactors %in% list(table))  
+  names(table) <- c("reactor", names(numbers_of_UNKNOWN_assigned_OTU_reactors)[[name_position]])
+  
+  UNKNOWN_assigned_OTU_all_taxonomic_levels_reactors <<- left_join(UNKNOWN_assigned_OTU_all_taxonomic_levels_reactors, table, by = "reactor")
+})
+
+expected_number_of_reads_UNKNOWN_OTUs_reactor <- column_to_rownames(total_reads_UNKNOWN_OTUs_reactors, "reactor")/column_to_rownames(UNKNOWN_assigned_OTU_all_taxonomic_levels_reactors[-5], "reactor")
+expected_percentage_of_reads_UNKNOWN_OTUs_reactor <- expected_number_of_reads_UNKNOWN_OTUs_reactor/column_to_rownames(total_reads_UNKNOWN_OTUs_reactors, "reactor") * 100 
+
+difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_reactors <- sapply(core_unknown_microbiome_reactor, function(table){
+  
+  name_position <- which(core_unknown_microbiome_reactor %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(core_unknown_microbiome_reactor)[[name_position]]
+  
+  difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level <- table %>%
+    mutate_if(is.numeric, ~round(./pull(expected_percentage_of_reads_UNKNOWN_OTUs_reactor, name_position), 2))
+
+
+  file_name = paste0("difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_", taxonomy_level, ".tsv")
+  
+  {setwd("core micriobiomes/by reactors/only names/unknown")
+
+   write_tsv(difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level,
+             file_name)
+
+   setwd("../../../..")}
+
+  difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level
+  
+})
+
+```
+
+##### added_substrate
+```{r}
+total_reads_UNKNOWN_OTUs_added_substrate <- total_reads_UNKNOWN_OTUs_per_sample_metadata %>%
+  select(-c("sample", "methane_production", "quality", "reactor")) %>%
+    group_by(added_supstrate) %>%
+    summarize(across(where(is.numeric), sum))
+
+numbers_of_UNKNOWN_assigned_OTU_added_substrate <- lapply(taxonomic_tables, function(table) {
+  table %>% 
+    left_join(x = metadata, y = ., by = "sample") %>%
+    select(-contains(c("Unassigned", "sample", "methane_production", "quality", "reactor"))) %>%  # removing unassigned columns
+    select(-ends_with("__")) %>%  # removing columns that do not contain assignment for that taxonomic level 
+    group_by(added_supstrate) %>%
+    summarize(across(where(is.numeric), sum)) %>%
+    rowwise() %>%
+    mutate(unknown = ncol(.) - 1 - sum(c_across(2:ncol(.)) == 0), .keep = "unused")
+})
+
+UNKNOWN_assigned_OTU_all_taxonomic_levels_added_substrate <- tibble(added_supstrate = c("/", "fats", "whey"))
+
+sapply(numbers_of_UNKNOWN_assigned_OTU_added_substrate, function(table){
+  
+  name_position <- which(numbers_of_UNKNOWN_assigned_OTU_added_substrate %in% list(table))  
+  names(table) <- c("added_supstrate", names(numbers_of_UNKNOWN_assigned_OTU_added_substrate)[[name_position]])
+  
+  UNKNOWN_assigned_OTU_all_taxonomic_levels_added_substrate <<- left_join(UNKNOWN_assigned_OTU_all_taxonomic_levels_added_substrate, table, by = "added_supstrate")
+})
+
+expected_number_of_reads_UNKNOWN_OTUs_added_substrate <- column_to_rownames(total_reads_UNKNOWN_OTUs_added_substrate, "added_supstrate")/column_to_rownames(UNKNOWN_assigned_OTU_all_taxonomic_levels_added_substrate[-5], "added_supstrate")
+expected_percentage_of_reads_UNKNOWN_OTUs_added_substrate <- expected_number_of_reads_UNKNOWN_OTUs_added_substrate/column_to_rownames(total_reads_UNKNOWN_OTUs_added_substrate, "added_supstrate") * 100 
+
+difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_added_substrate <- sapply(core_unknown_microbiome_substrate, function(table){
+  
+  name_position <- which(core_unknown_microbiome_substrate %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(core_unknown_microbiome_substrate)[[name_position]]
+  
+  difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level <- table %>%
+    mutate_if(is.numeric, ~round(./pull(expected_percentage_of_reads_UNKNOWN_OTUs_added_substrate, name_position), 2))
+
+
+  file_name = paste0("difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_", taxonomy_level, ".tsv")
+  
+  {setwd("core micriobiomes/by substrate/only names/unknown")
+
+   write_tsv(difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level,
+             file_name)
+
+   setwd("../../../..")}
+
+  difference_of_percentage_than_expected_percentage_of_core_unknown_microbiome_for_the_level
+  
+})
+```
+
+```{r}
+raw_tables <- readRDS("list_of_taxonomic_tables.RData")
+
+needed <- names(raw_tables)[c(2, 3, 7)]
+lapply(raw_tables[c(2, 3, 7)], function(table){
+  
+  name_position <- which(raw_tables %in% list(table))  # needed for proper mapping and automatic naming
+  taxonomy_level <- names(raw_tables)[[name_position]]
+  
+  P <- table %>%
+    select(-contains(c("methane_production", "quality", "reactor", "added_"))) %>%
+    Percentage.in.sample
+  
+  write_tsv(P, file = paste0(taxonomy_level, "_percentage.tsv"))
+  
+  })
+```
+
+
+## ANCOM filtering
+```{r}
+filtered_taxonomic_tables <- lapply(taxonomic_tables, Filtering.50.or.more)
+```
+
+### Number of unique assigned OTU 
+#### among all samples
+```{r}
+numbers_of_unique_assigned_OTU_samples50 <- lapply(filtered_taxonomic_tables, Unique.assigned.OTU, by_what = "sample", metadata = metadata)
+
+dir.create("Numbers of unique assigned OTUs")
+unique_assigned_OTU_all_taxonomic_levels50 <- Saving.OTU.numbers.all.levels(numbers_of_unique_assigned_OTU_samples50, 
+                                                                            filtered_taxonomic_tables, 
+                                                                            "Numbers of unique assigned OTUs/number_of_unique_assigned_OTU_samples50.tsv",
+                                                                            "sample")
+```
+
+#### among reactor
+```{r}
+numbers_of_unique_assigned_OTU_reactor50 <- lapply(filtered_taxonomic_tables, Unique.assigned.OTU, by_what = "reactor", metadata = metadata)
+
+unique_assigned_OTU_all_taxonomic_levels_reactors50 <- Saving.OTU.numbers.all.levels(numbers_of_unique_assigned_OTU_reactor50, 
+                                                                                     filtered_taxonomic_tables, 
+                                                                                     "Numbers of unique assigned OTUs/number_of_unique_assigned_OTU_reactor50.tsv",
+                                                                                     "reactor")
+```
+
+#### among substrates
+```{r}
+numbers_of_unique_assigned_OTU_substrate50 <- lapply(filtered_taxonomic_tables, Unique.assigned.OTU, by_what = "added_supstrate", metadata = metadata)
+
+unique_assigned_OTU_all_taxonomic_levels_substrate50 <- Saving.OTU.numbers.all.levels(numbers_of_unique_assigned_OTU_substrate50, 
+                                                                                      filtered_taxonomic_tables, 
+                                                                                      "Numbers of unique assigned OTUs/number_of_unique_assigned_OTU_substrate50.tsv",
+                                                                                      "added_supstrate")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+unique_among_all <- lapply(taxonomic_tables, Unique.among.all)
+unique_among_all50 <- lapply(filtered_taxonomic_tables, Unique.among.all)
+
+sapply(unique_among_all[-4], function(table) {
+  
+  bac <- table %>% 
+    select(contains(match = "k__Bacteria",
+                    ignore.case = FALSE))
+  
+  arh <- table %>% 
+    select(-contains(match = "k__Bacteria",
+                    ignore.case = FALSE))
+
+  c("arh", ncol(arh), "bac", ncol(bac))
+})
+
+sapply(unique_among_all50[-4], function(table) {
+  
+    bac <- table %>% 
+    select(contains(match = "k__Bacteria",
+                    ignore.case = FALSE))
+  
+  arh <- table %>% 
+    select(-contains(match = "k__Bacteria",
+                    ignore.case = FALSE))
+
+  c("arh", ncol(arh), "bac", ncol(bac))
+})
+```
+
+
+
+
+
+
+```{r}
+unknown_among_all <- lapply(taxonomic_tables, Unique.among.all.unknown)
+unknown_among_all_names <- lapply(unknown_among_all, names)
+
+sapply(unknown_among_all_names, length)
+```
+
+
+
+
+
+
